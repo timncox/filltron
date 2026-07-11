@@ -1,0 +1,379 @@
+/*
+ * Filltron — Signal Chain UI
+ *
+ * Loads when Smack's component editor is opened inside a slot's Signal
+ * Chain (the Master FX editor uses auto-generated knob pages instead).
+ *
+ * Controls while this screen is open:
+ *   Pad 68 (bottom-left)  CAPTURE — retro-grab the last loop-length   [green]
+ *   Pad 69                ARM     — record from next step boundary    [red]
+ *   Pad 70                A/B     — clean loop vs pattern             [white/grey]
+ *   Pad 71                RE-ROLL — new random pattern                [blue]
+ *   Pad 76 (above 68)     CLEAR   — drop the loop                     [dim orange]
+ *   Pad 77 (above 69)     FILL    — tap latches, hold is momentary    [yellow]
+ *   Capture button (CC52) same as pad 68
+ *   Steps 1-16            pattern display (color = effect per slice);
+ *                         press to mute a slice's effect, press again
+ *                         to restore the seeded one; shows the fill
+ *                         pattern while Fill is active
+ *   Knobs 1-8             FX Density, Order, Loop Len, Slice Res,
+ *                         Wet, Pitch Range, Fill Amt, Seed
+ *                         (AB Quantize moved to the Setup knob page)
+ *
+ * Screen reader: pad actions, knob changes and loop-state transitions are
+ * announced via shared/screen_reader.mjs when the reader is enabled.
+ */
+
+import {
+    MoveKnob1, MoveCapture,
+    Black, White, LightGrey, Red, BrightRed, Blue, Green, BrightGreen,
+    Cyan, Purple, YellowGreen, OrangeRed
+} from '/data/UserData/schwung/shared/constants.mjs';
+
+import { decodeDelta, setLED } from '/data/UserData/schwung/shared/input_filter.mjs';
+
+import {
+    drawMenuHeader as drawHeader,
+    drawMenuFooter as drawFooter
+} from '/data/UserData/schwung/shared/menu_layout.mjs';
+
+import {
+    announce, announceParameter, announceView
+} from '/data/UserData/schwung/shared/screen_reader.mjs';
+
+
+/* Transport pads (bottom-left corner of the 8x4 grid) */
+const PAD_CAPTURE = 68;
+const PAD_ARM     = 69;
+const PAD_AB      = 70;
+const PAD_REROLL  = 71;
+const PAD_CLEAR   = 76;
+const PAD_FILL    = 77;
+
+/* Step buttons show the first 16 slices */
+const STEP_FIRST = 16;
+const STEP_COUNT = 16;
+
+/* Slice LED color by effect code (matches smack_fx_t order in the DSP) */
+const FX_COLORS = [
+    0x10,        /* NONE      — dim white: slice exists, plays clean */
+    Red,         /* RETRIG */
+    Blue,        /* REVERSE */
+    Purple,      /* PITCH */
+    Cyan,        /* SPEED */
+    YellowGreen, /* GATE */
+    OrangeRed,   /* BUZZ */
+    BrightGreen, /* CRUSH */
+    BrightRed,   /* REPEAT */
+    Blue,        /* REVAFTER  — reverse family */
+    LightGrey,   /* TAPESTOP */
+    Green,       /* TAPESTART */
+    Purple,      /* SCRATCH   — pitch family */
+    0x30,        /* ENV       — mid white */
+    Cyan,        /* PAN       — stereo/speed family */
+    YellowGreen, /* FILTER    — sweep family */
+    Green,       /* VOWEL */
+    OrangeRed,   /* TONALDELAY — buzz/delay family */
+    White,       /* FREEZE */
+    Cyan,        /* DELAY */
+    BrightRed,   /* DIST */
+    Purple,      /* PHASER */
+    LightGrey    /* VERB */
+];
+
+const STATE_NAMES = ['IDLE', 'ARMED', 'REC', 'LOOP'];
+const STATE_SPEECH = ['idle', 'armed', 'recording', 'looping'];
+
+/* Knobs 1-8 (CC 71-78) left to right. `name`/`opts` are the terse screen
+ * strings; `speech`/`speechOpts`/`unit` are what the screen reader says
+ * (abbreviations like "½st" read as gibberish through TTS). */
+const KNOBS = [
+    { key: 'fx_density',    name: 'FX',   min: 0, max: 100, step: 5,
+      speech: 'FX Density', unit: ' percent' },
+    { key: 'order_density', name: 'Ord',  min: 0, max: 100, step: 5,
+      speech: 'Order Density', unit: ' percent' },
+    { key: 'loop_len',      name: 'Len',  opts: ['1st', '2st', '1bt', '2bt', '1br', '2br', '4br', '8br', '16b'],
+      speech: 'Loop Length',
+      speechOpts: ['1 step', '2 steps', '1 beat', '2 beats', '1 bar', '2 bars', '4 bars', '8 bars', '16 bars'] },
+    { key: 'slice_res',     name: 'Res',  opts: ['½st', '1st', '2st', '4st'],
+      speech: 'Slice Resolution',
+      speechOpts: ['half step', '1 step', '2 steps', '4 steps'] },
+    { key: 'wet',           name: 'Wet',  min: 0, max: 100, step: 5,
+      speech: 'Wet', unit: ' percent' },
+    { key: 'pitch_range',   name: 'Pit',  min: 1, max: 12,  step: 1,
+      speech: 'Pitch Range', unit: ' semitones' },
+    { key: 'fill_amt',      name: 'Fill', min: 0, max: 100, step: 5,
+      speech: 'Fill Amount', unit: ' percent' },
+    { key: 'seed',          name: 'Seed', min: 1, max: 9999, step: 1,
+      speech: 'Seed' }
+];
+
+let knobValues = [50, 0, 4, 1, 100, 12, 75, 4303];
+let state = 0;          /* 0 idle, 1 armed, 2 rec, 3 looping */
+let ab = 1;
+let fill = 0;
+let fillPattern = '';
+let fillPressAt = 0;    /* ms timestamp of the fill-pad press */
+let fillPressLit = false; /* the press turned fill on (vs toggled it off) */
+let pattern = '';
+let nSlices = 0;
+let playSlice = -1;
+let tickCount = 0;
+let needsRedraw = true;
+
+/* below this hold time a fill-pad press is a tap (latch); above it the
+ * press is momentary and release turns fill back off */
+const FILL_TAP_MS = 350;
+
+function gp(key) {
+    const v = host_module_get_param(key);
+    return (v === null || v === undefined) ? null : String(v);
+}
+
+function fetchAll() {
+    for (let i = 0; i < KNOBS.length; i++) {
+        const v = gp(KNOBS[i].key);
+        if (v !== null) knobValues[i] = parseFloat(v) || 0;
+    }
+    state = parseInt(gp('run_state') || '0');
+    ab = parseInt(gp('ab') || '1');
+    fill = parseInt(gp('fill') || '0');
+    pattern = gp('pattern') || '';
+    fillPattern = gp('fill_pattern') || '';
+    nSlices = parseInt(gp('n_slices') || '0');
+}
+
+function knobDisplay(i) {
+    const k = KNOBS[i];
+    if (k.opts) {
+        const idx = Math.max(0, Math.min(k.opts.length - 1, Math.round(knobValues[i])));
+        return k.opts[idx];
+    }
+    return `${Math.round(knobValues[i])}`;
+}
+
+function knobSpeech(i) {
+    const k = KNOBS[i];
+    if (k.speechOpts) {
+        const idx = Math.max(0, Math.min(k.speechOpts.length - 1, Math.round(knobValues[i])));
+        return k.speechOpts[idx];
+    }
+    return `${Math.round(knobValues[i])}${k.unit || ''}`;
+}
+
+function adjustKnob(i, delta) {
+    const k = KNOBS[i];
+    const max = k.opts ? k.opts.length - 1 : k.max;
+    const min = k.opts ? 0 : k.min;
+    const step = k.opts ? 1 : k.step;
+    let v = Math.max(min, Math.min(max, knobValues[i] + delta * step));
+    if (v === knobValues[i]) return;
+    knobValues[i] = v;
+    host_module_set_param(k.key, `${Math.round(v)}`);
+    announceParameter(k.speech, knobSpeech(i));
+    needsRedraw = true;
+}
+
+/* ---- LEDs ---- */
+
+function updateTransportLEDs() {
+    setLED(PAD_CAPTURE, Green);
+    setLED(PAD_ARM, state === 1 || state === 2 ? BrightRed : Red);
+    setLED(PAD_AB, state === 3 ? (ab ? White : LightGrey) : Black);
+    setLED(PAD_REROLL, Blue);
+    setLED(PAD_CLEAR, state === 3 ? OrangeRed : Black);
+    setLED(PAD_FILL, state === 3 ? (fill ? White : YellowGreen) : Black);
+}
+
+function updateStepLEDs() {
+    const shown = Math.min(nSlices, STEP_COUNT);
+    for (let i = 0; i < STEP_COUNT; i++) {
+        let color = Black;
+        if (state === 3 && i < shown) {
+            const src = fill ? fillPattern : pattern;
+            const code = src.charCodeAt(i) - 48;
+            color = FX_COLORS[(code >= 0 && code < FX_COLORS.length) ? code : 0];
+            /* B side shows the pattern; A side shows all-clean; the fill
+             * layer sounds over either side, so it always shows itself */
+            if (!ab && !fill) color = FX_COLORS[0];
+            if (i === playSlice) color = White;   /* playhead chase */
+        }
+        setLED(STEP_FIRST + i, color);
+    }
+}
+
+/* ---- Screen ---- */
+
+function drawUI() {
+    clear_screen();
+    let title = 'FILLTRON  ' + STATE_NAMES[state];
+    if (state === 3) title += fill ? ' · FILL' : (ab ? ' · B' : ' · A');
+    drawHeader(title);
+
+    /* two rows of four knob params */
+    for (let i = 0; i < 8; i++) {
+        const col = i % 4, row = (i / 4) | 0;
+        const x = 2 + col * 32;
+        const y = 15 + row * 20;
+        print(x, y, KNOBS[i].name, 1);
+        print(x, y + 8, knobDisplay(i), 1);
+    }
+
+    /* pattern summary line */
+    if (state === 3) {
+        let fxCount = 0;
+        for (let i = 0; i < pattern.length; i++)
+            if (pattern[i] !== '0') fxCount++;
+        print(2, 55, `${nSlices} slices  ${fxCount} fx`, 1);
+    }
+
+    drawFooter({ left: 'Cap Arm A/B Roll', right: 'Step:mute' });
+    needsRedraw = false;
+}
+
+/* ---- Lifecycle ---- */
+
+function init() {
+    fetchAll();
+    playSlice = -1;
+    updateTransportLEDs();
+    updateStepLEDs();
+    needsRedraw = true;
+    let spoken = 'Filltron, ' + STATE_SPEECH[state];
+    if (state === 3) spoken += ab ? ', side B' : ', side A';
+    if (fill) spoken += ', fill on';
+    announceView(spoken);
+}
+
+function tick() {
+    tickCount++;
+
+    /* playhead chase: cheap single get_param per tick */
+    if (state === 3) {
+        const ps = parseInt(gp('play_slice') || '-1');
+        if (ps !== playSlice) {
+            playSlice = ps;
+            updateStepLEDs();
+        }
+    }
+
+    /* periodic state/pattern refresh (knob edits, quantized AB flips) */
+    if (tickCount % 12 === 0) {
+        const oldState = state, oldAb = ab, oldFill = fill, oldPattern = pattern;
+        state = parseInt(gp('run_state') || '0');
+        ab = parseInt(gp('ab') || '1');
+        fill = parseInt(gp('fill') || '0');
+        pattern = gp('pattern') || '';
+        fillPattern = gp('fill_pattern') || '';
+        nSlices = parseInt(gp('n_slices') || '0');
+        /* speak async transitions (armed -> recording -> looping) as they
+         * land; A/B and Fill are announced at press time instead, because
+         * the applied value lags the pad while a quantized flip is pending */
+        if (state !== oldState)
+            announce(state === 3 ? `looping, ${nSlices} slices` : STATE_SPEECH[state]);
+        if (state !== oldState || ab !== oldAb || fill !== oldFill ||
+            pattern !== oldPattern) {
+            updateTransportLEDs();
+            updateStepLEDs();
+            needsRedraw = true;
+        }
+    }
+
+    if (needsRedraw) drawUI();
+}
+
+function onMidiMessageInternal(data) {
+    const status = data[0] & 0xF0;
+    const d1 = data[1];
+    const d2 = data[2];
+
+    if (status === 0xB0) {
+        /* Capture button mirrors the capture pad */
+        if (d1 === MoveCapture && d2 >= 64) {
+            host_module_set_param('capture', '1');
+            announce('Capture');
+            refreshSoon();
+            return;
+        }
+        /* Knobs 1-8 */
+        if (d1 >= MoveKnob1 && d1 < MoveKnob1 + 8) {
+            const delta = decodeDelta(d2);
+            if (delta !== 0) adjustKnob(d1 - MoveKnob1, delta);
+            return;
+        }
+        return;
+    }
+
+    /* Fill pad release: a quick tap latched at press time; a hold is
+     * momentary and turns fill back off here */
+    if ((status === 0x80 || (status === 0x90 && d2 === 0)) && d1 === PAD_FILL) {
+        if (fillPressLit && Date.now() - fillPressAt >= FILL_TAP_MS) {
+            fill = 0;
+            host_module_set_param('fill', '0');
+            announce('Fill off');
+            updateTransportLEDs();
+            updateStepLEDs();
+            refreshSoon();
+        } else if (fillPressLit) {
+            announce('Fill latched');
+        }
+        fillPressLit = false;
+        return;
+    }
+
+    if (status === 0x90 && d2 > 0) {
+        /* Transport pads */
+        if (d1 === PAD_CAPTURE) { host_module_set_param('capture', '1'); announce('Capture');  refreshSoon(); return; }
+        if (d1 === PAD_ARM)     { host_module_set_param('arm', '1');     announce('Arm');      refreshSoon(); return; }
+        if (d1 === PAD_REROLL)  { host_module_set_param('reroll', '1');  announce('Re-roll');  refreshSoon(); return; }
+        if (d1 === PAD_CLEAR)   { host_module_set_param('clear', '1');   announce('Clear');    refreshSoon(); return; }
+        if (d1 === PAD_FILL) {
+            if (state !== 3) { announce('No loop yet'); return; }
+            fillPressAt = Date.now();
+            fillPressLit = !fill;
+            fill = fill ? 0 : 1;
+            host_module_set_param('fill', `${fill}`);
+            announce(fill ? 'Fill' : 'Fill off');
+            updateTransportLEDs();
+            updateStepLEDs();
+            refreshSoon();
+            return;
+        }
+        if (d1 === PAD_AB) {
+            ab = ab ? 0 : 1;
+            host_module_set_param('ab', `${ab}`);
+            announce(ab ? 'B, pattern' : 'A, clean loop');
+            refreshSoon();
+            return;
+        }
+
+        /* Step press: mute a slice's effect / restore the seeded one */
+        if (d1 >= STEP_FIRST && d1 < STEP_FIRST + STEP_COUNT) {
+            const i = d1 - STEP_FIRST;
+            if (state === 3 && i < nSlices) {
+                const code = pattern.charCodeAt(i) - 48;
+                if (code > 0) {
+                    host_module_set_param(`lock_slice_${i}`, '0');
+                    announce(`Slice ${i + 1} muted`);
+                } else {
+                    host_module_set_param(`lock_slice_${i}`, '-1');
+                    announce(`Slice ${i + 1} restored`);
+                }
+                refreshSoon();
+            }
+            return;
+        }
+    }
+}
+
+/* pull fresh state on the next periodic refresh instead of immediately —
+ * quantized actions (AB at loop boundary, armed record) land later anyway */
+function refreshSoon() {
+    tickCount = -1; /* forces the %12 refresh on next tick */
+}
+
+globalThis.chain_ui = {
+    init,
+    tick,
+    onMidiMessageInternal
+};
