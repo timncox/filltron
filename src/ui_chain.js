@@ -130,17 +130,37 @@ function gp(key) {
     return (v === null || v === undefined) ? null : String(v);
 }
 
+/* Read one key, keeping `prev` when it does not come back.
+ *
+ * A gp() is a BLOCKING round-trip to the shim, serviced once per SPI frame
+ * (~23 ms) and abandoned after 100 ms — schwung's comment above
+ * js_shadow_get_param calls it "the where-does-the-tick-time-go measurement".
+ * The channel serves about 44 a second in total, so under load reads TIME OUT
+ * and return null. Folding null into a literal default (`gp('ab') || '1'`)
+ * puts that default into the mirror, and the mirror is written back to the DSP
+ * on the next knob turn — a quiet way to lose the loop's settings. This module
+ * is well inside the read budget, but the write-back hazard is the same. */
+function gpNumOr(key, prev) {
+    const s = gp(key);
+    if (s === null || s === '') return prev;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : prev;
+}
+
+function gpStrOr(key, prev) {
+    const s = gp(key);
+    return s === null ? prev : s;
+}
+
 function fetchAll() {
-    for (let i = 0; i < KNOBS.length; i++) {
-        const v = gp(KNOBS[i].key);
-        if (v !== null) knobValues[i] = parseFloat(v) || 0;
-    }
-    state = parseInt(gp('run_state') || '0');
-    ab = parseInt(gp('ab') || '1');
-    fill = parseInt(gp('fill') || '0');
-    pattern = gp('pattern') || '';
-    fillPattern = gp('fill_pattern') || '';
-    nSlices = parseInt(gp('n_slices') || '0');
+    for (let i = 0; i < KNOBS.length; i++)
+        knobValues[i] = gpNumOr(KNOBS[i].key, knobValues[i]);
+    state = gpNumOr('run_state', state);
+    ab = gpNumOr('ab', ab);
+    fill = gpNumOr('fill', fill);
+    pattern = gpStrOr('pattern', pattern);
+    fillPattern = gpStrOr('fill_pattern', fillPattern);
+    nSlices = gpNumOr('n_slices', nSlices);
 }
 
 function knobDisplay(i) {
@@ -161,12 +181,26 @@ function knobSpeech(i) {
     return `${Math.round(knobValues[i])}${k.unit || ''}`;
 }
 
+/* decodeDelta reports ACCUMULATED encoder movement — the shim batches ticks
+ * per SPI frame, so one brisk turn arrives as a single event carrying 20 or
+ * more. Pitch Range is 1-12 and the enum knobs are shorter still, so a raw
+ * delta pins them to an end stop and makes the values in between unreachable
+ * by a normal turn. Cap the magnitude at a quarter of the range, counted in
+ * steps rather than units. */
+function scaledSteps(delta, min, max, step) {
+    const span = Math.max(1, Math.round((max - min) / (step || 1)));
+    const cap = Math.max(1, Math.ceil(span / 4));
+    const mag = Math.min(Math.abs(delta), cap);
+    return delta > 0 ? mag : -mag;
+}
+
 function adjustKnob(i, delta) {
     const k = KNOBS[i];
     const max = k.opts ? k.opts.length - 1 : k.max;
     const min = k.opts ? 0 : k.min;
     const step = k.opts ? 1 : k.step;
-    let v = Math.max(min, Math.min(max, knobValues[i] + delta * step));
+    let v = Math.max(min, Math.min(max,
+        knobValues[i] + scaledSteps(delta, min, max, step) * step));
     if (v === knobValues[i]) return;
     knobValues[i] = v;
     host_module_set_param(k.key, `${Math.round(v)}`);
@@ -248,8 +282,12 @@ function init() {
 function tick() {
     tickCount++;
 
-    /* playhead chase: cheap single get_param per tick */
-    if (state === 3) {
+    /* Playhead chase, every third tick. A single get_param is NOT cheap: it
+     * busy-waits for the shim and is serviced once per SPI frame (~23 ms), and
+     * the channel only serves about 44 a second in total. Polling every tick
+     * claimed the whole of it. Fifteen slice updates a second still look
+     * continuous on the step LEDs. */
+    if (state === 3 && tickCount % 3 === 0) {
         const ps = parseInt(gp('play_slice') || '-1');
         if (ps !== playSlice) {
             playSlice = ps;
@@ -258,14 +296,14 @@ function tick() {
     }
 
     /* periodic state/pattern refresh (knob edits, quantized AB flips) */
-    if (tickCount % 12 === 0) {
+    if (tickCount % 24 === 0) {
         const oldState = state, oldAb = ab, oldFill = fill, oldPattern = pattern;
-        state = parseInt(gp('run_state') || '0');
-        ab = parseInt(gp('ab') || '1');
-        fill = parseInt(gp('fill') || '0');
-        pattern = gp('pattern') || '';
-        fillPattern = gp('fill_pattern') || '';
-        nSlices = parseInt(gp('n_slices') || '0');
+        state = gpNumOr('run_state', state);
+        ab = gpNumOr('ab', ab);
+        fill = gpNumOr('fill', fill);
+        pattern = gpStrOr('pattern', pattern);
+        fillPattern = gpStrOr('fill_pattern', fillPattern);
+        nSlices = gpNumOr('n_slices', nSlices);
         /* speak async transitions (armed -> recording -> looping) as they
          * land; A/B and Fill are announced at press time instead, because
          * the applied value lags the pad while a quantized flip is pending */
